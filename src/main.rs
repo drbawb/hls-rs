@@ -288,6 +288,7 @@ fn begin_stream(src: &MuxSettings, prof: &Profile) -> Result<Child, failure::Err
 		.arg("-r").arg("30")
 		.arg("-b:a").arg(&prof.bitrate_audio)
 		.arg("-c:a").arg("libfdk_aac")
+		.arg("-preset").arg("veryfast")
 		.arg("-map").arg(&format!("v:{}", src.idx_v))
 		.arg("-map").arg(&format!("a:{}", src.idx_a));
 		
