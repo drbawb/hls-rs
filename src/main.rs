@@ -8,7 +8,7 @@ extern crate serde_json;
 
 use std::process::{Child, Command, Stdio};
 
-static HLS_ROOT:  &str = "./hls-frags";
+static HLS_ROOT:  &str = "/srv/hls";
 static TEST_FILE: &str = "/srv/movies/weeb-test/yzq-01.mkv";
 
 #[derive(Debug, Deserialize)]
@@ -101,31 +101,75 @@ fn main() -> Result<(), failure::Error> {
 	let stream_a = &audio_streams[0];
 	let stream_v = &video_streams[0];
 
-	let mut muxer = begin_stream(TEST_FILE, &Profile {
+	let mut muxer_src = begin_stream(TEST_FILE, &Profile {
+		level_name: "cdn00_src",
 		bitrate_video: String::from("3000k"),
+		bitrate_audio: String::from("192k"),
+	})?;
+
+	let mut muxer_mid = begin_stream(TEST_FILE, &Profile {
+		level_name: "cdn00_mid",
+		bitrate_video: String::from("2250k"),
 		bitrate_audio: String::from("128k"),
 	})?;
 
+	let mut muxer_low = begin_stream(TEST_FILE, &Profile {
+		level_name: "cdn00_low",
+		bitrate_video: String::from("960k"),
+		bitrate_audio: String::from("96k"),
+	})?;
+
 	info!("waiting on streams ...");
-	muxer.wait();
+	write_master_playlist()?;
+	muxer_src.wait();
+	muxer_mid.wait();
+	muxer_low.wait();
 
 	info!("all done :-)");
 	Ok(())
 }
 
 struct Profile {
+	level_name: &'static str,
 	bitrate_video: String,
 	bitrate_audio: String,
 }
 
+fn write_master_playlist() -> Result<(), failure::Error> {
+	use std::fs::File;
+	use std::io::Write;
+
+	let mut pl = File::create(format!("{}/cdn00.m3u8", HLS_ROOT))?;
+
+	// write the HLS header
+	writeln!(pl, "#EXTM3U")?;
+	writeln!(pl, "#EXT-X-VERSION:3")?;
+
+	// write renditions 
+	writeln!(pl, "#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x1080")?;
+	writeln!(pl, "cdn00_src/index.m3u8")?;
+
+	writeln!(pl, "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080")?;
+	writeln!(pl, "cdn00_mid/index.m3u8")?;
+
+	// write source rendition
+	writeln!(pl, "#EXT-X-STREAM-INF:BANDWIDTH=960000,RESOLUTION=1920x1080")?;
+	writeln!(pl, "cdn00_low/index.m3u8")?;
+
+	Ok(())
+}
+
 fn begin_stream(src_path: &str, prof: &Profile) -> Result<Child, failure::Error> {
+	let seg_path = format!("{}/{}/index.m3u8", HLS_ROOT, prof.level_name);
+	let seg_name = format!("{}/{}/%03d.ts", HLS_ROOT, prof.level_name);
+
 	let ffmpeg_result = Command::new("ffmpeg")
 		.arg("-y")
 		.arg("-re")
 		.arg("-i").arg(src_path)
 		.arg("-b:v").arg(&prof.bitrate_video)
 		.arg("-c:v").arg("libx264")
-		.arg("-x264opts").arg("keyint=60:no-scenecut")
+		.arg("-x264opts").arg("keyint=300:no-scenecut")
 		.arg("-profile:v").arg("main")
 		.arg("-r").arg("30")
 		.arg("-b:a").arg(&prof.bitrate_audio)
@@ -133,7 +177,10 @@ fn begin_stream(src_path: &str, prof: &Profile) -> Result<Child, failure::Error>
 		.arg("-map").arg("0:v")
 		.arg("-map").arg("0:a")
 		.arg("-hls_list_size").arg("10")
-		.arg(&format!("{}/test.m3u8", HLS_ROOT))
+		.arg("-hls_time").arg("10")
+		.arg("-hls_flags").arg("delete_segments")
+		.arg("-hls_segment_filename").arg(seg_name)
+		.arg(&seg_path)
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.spawn()?;
