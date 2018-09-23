@@ -1,0 +1,47 @@
+# hls-rs
+
+This program uses the `ffmpeg` CLI to identify content streams & begin
+transcoding multiple variants of the stream using the HLS muxer. Then
+the program manages a master HLS playlist which can be used to have a
+client start the HLS stream.
+
+## DISCLAIMER
+
+This program is *alpha quality.* -- While it mostly works there are
+a few things to be aware of:
+
+- This program assumes all distributions belong in the following folder
+  structure, and will error if they do not exist:
+
+  - /srv/hls
+  - /srv/hls/cdn00_{src,mid,low}
+
+- This program does not clean up the *master playlist* when it is finished
+  with a stream. 
+
+- Currently this program starts three separate encoder processes, which share
+  no state. A potential area for future optimization would be to split the
+  passes into different operations, e.g: scaling, compositing (subtitles), 
+  and finally transcoding after the common pipeline is finished.
+
+## Pre-requisites
+
+- a recent build of ffmpeg
+- the libx264 and libfdk_aac encoders
+- decoders for whatever media you intend to play
+- fonts installed if you're using a subtitle file
+
+
+## Installation
+
+- `cargo build`
+- `hls-rs <INPUT> [<SUBTITLE>]`
+- OR `hls-rs --help`
+
+## TODO / Wishlist
+
+- Command line flags for controlling bitrates
+- Command line flags to skip interactive stream selection
+- Command line flag for controlling HLS distribution root
+- Need to manage directory structure ourselves
+- 
