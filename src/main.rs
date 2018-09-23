@@ -1,15 +1,55 @@
+#[macro_use] extern crate failure;
 #[macro_use] extern crate log;
 #[macro_use] extern crate serde_derive;
 
+extern crate clap;
 extern crate env_logger;
-extern crate failure;
 extern crate serde;
 extern crate serde_json;
 
+use clap::{Arg, App, SubCommand};
+use std::io;
 use std::process::{Child, Command, Stdio};
 
 static HLS_ROOT:  &str = "/srv/hls";
-static TEST_FILE: &str = "/srv/movies/weeb-test/yzq-01.mkv";
+
+/// Represents a user's selection of streams
+#[derive(Debug)]
+struct MuxSettings {
+	av_path: String,
+	st_path: Option<String>,
+
+	idx_a:  usize,
+	idx_v:  usize,
+	ids_st: Option<usize>,
+}
+
+struct Profile {
+	level_name: &'static str,
+	bitrate_video: String,
+	bitrate_audio: String,
+}
+
+/// Table of individual sub-streams for a given set of inputs
+#[derive(Debug, Deserialize)]
+struct StreamTable {
+	video:  Vec<StreamResult>,
+	audio:  Vec<StreamResult>,
+	attach: Vec<StreamResult>,
+	subs:   Vec<StreamResult>,
+}
+
+impl StreamTable {
+	pub fn new() -> Self {
+		StreamTable {
+			video:  vec![],
+			audio:  vec![],
+			attach: vec![],
+			subs:   vec![],
+		}
+	}
+}
+
 
 #[derive(Debug, Deserialize)]
 struct ProbeResult {
@@ -51,6 +91,12 @@ impl<'a> From<&'a str> for CodecType {
 	}
 }
 
+#[derive(Debug, Fail)]
+enum CliError {
+	#[fail(display = "missing input file")]	
+	MissingInput,
+}
+
 fn main() -> Result<(), failure::Error> {
 	env_logger::init();
 	info!("starting HLS stream");
@@ -62,58 +108,127 @@ fn main() -> Result<(), failure::Error> {
 	// - start transcoding individual streams
 	// - create a master playlist
 
-	let probe = read_streams(TEST_FILE)?;
-	info!("got streams:\n {:?}", probe);
+	// read command line input
+	let matches = App::new("hls-rs")
+		.version("0.0")
+		.author("hime@localhost")
+		.about("Opens an AV stream and creates a series of realtime HLS playlists.")
+		.arg(Arg::with_name("INPUT")
+			 .help("The main input file, containing at least one video & audio track.")
+			 .required(true)
+			 .index(1))
+		.arg(Arg::with_name("SUBTITLE")
+			 .help("A secondary input file containing at least one subtitle track, and any number of attachments.")
+			 .required(false)
+			 .index(2))
+		.get_matches();
+
+	let input_av = matches.value_of("INPUT")
+		.ok_or(CliError::MissingInput)?;
+
+
+	let input_subs = matches.value_of("SUBTITLE");
+
+	info!("probing input file: {}", input_av);
+
+	let probe_av = read_streams(input_av)?;
+	info!("got streams:\n {:?}", probe_av);
 
 	// setup stream tables
-	let mut audio_streams  = vec![];
-	let mut attach_streams = vec![];
-	let mut video_streams  = vec![];
-	let mut sub_streams    = vec![];
+	let mut streams = StreamTable::new();
 
-	for stream in probe.streams {
+	// read the av file
+	for stream in probe_av.streams {
 		let codec_ty = CodecType::from(&stream.codec_type[..]);
 
 		match codec_ty {
-			CodecType::Attachment => attach_streams.push(stream),
-			CodecType::Audio      => audio_streams.push(stream),
-			CodecType::Video      => video_streams.push(stream),
-			CodecType::Subtitle   => sub_streams.push(stream),
+			CodecType::Audio      => streams.audio.push(stream),
+			CodecType::Video      => streams.video.push(stream),
+
+			// read these later
+			CodecType::Attachment => debug!("av: ignoring attachment"),
+			CodecType::Subtitle   => debug!("av: subtitle track"),
 
 			unknown => warn!("unknown codec: {:?}", unknown),
 		}
 	}
 
-	info!("finished reading stream data");
-	info!("video\t{}",  video_streams.len());
-	info!("audio\t{}",  audio_streams.len());
-	info!("subs\t{}",   sub_streams.len());
-	info!("attach\t{}", attach_streams.len());
+	// read the subs file
+	info!("probing subs: {:?}", input_subs);
+	if let Some(input_subs) = input_subs {
+		let probe_av = read_streams(input_subs)?;
+		info!("got st streams:\n {:?}", probe_av);
 
-	// TODO return errors
-	if video_streams.len() == 0 || audio_streams.len() == 0 {
-		warn!("no streams to mux ... exiting");
-		return Ok(())
+		for stream in probe_av.streams {
+			let codec_ty = CodecType::from(&stream.codec_type[..]);
+
+			match codec_ty {
+				CodecType::Audio      => debug!("sub: ignoring audio"),
+				CodecType::Video      => debug!("sub: ignoring video"),
+
+				// read these later
+				CodecType::Attachment => streams.attach.push(stream),
+				CodecType::Subtitle   => streams.subs.push(stream),
+
+				unknown => warn!("unknown codec: {:?}", unknown),
+			}
+		}	
 	}
 
+	info!("finished reading stream data");
+	info!("video\t{}", streams.video.len());
+	info!("audio\t{}", streams.audio.len()); 
+	info!("subs\t{}",  streams.subs.len()); 
+	info!("attach\t{}",streams.attach.len()); 
 
-	// TODO select streams to map by UI
-	let stream_a = &audio_streams[0];
-	let stream_v = &video_streams[0];
+	fn select_stream_idx(name: &str, streams: &Vec<StreamResult>) -> Result<usize, io::Error> {
+	
+		println!("select {} track:", name);	
+		for (idx, stream) in streams.iter().enumerate() {
+			println!("{}: {}", idx, stream.codec_name);
+		}
 
-	let mut muxer_src = begin_stream(TEST_FILE, &Profile {
+		let mut buf = String::new();
+		loop {
+			buf.truncate(0);
+			io::stdin().read_line(&mut buf)?;
+			match buf.trim().parse() {
+				Ok(num) => return Ok(num),
+				Err(msg) => warn!("err: {}", msg),
+			}
+		}
+	}
+
+	let mut mux_settings = MuxSettings {
+		av_path: input_av.to_string(),
+		st_path: input_subs.map(|x| x.to_string()),
+
+		idx_a:  0,
+		idx_v:  0,
+		ids_st: None,
+	};
+
+	mux_settings.idx_v = select_stream_idx("video", &streams.video)?;
+	mux_settings.idx_a = select_stream_idx("audio", &streams.audio)?;
+
+	// prompt user to select subtitle stream if its loaded
+	if mux_settings.st_path.is_some() {
+		mux_settings.ids_st = Some(select_stream_idx("subs", &streams.subs)?);	
+	}
+
+	let mut muxer_src = begin_stream(&mux_settings, &Profile {
 		level_name: "cdn00_src",
 		bitrate_video: String::from("3000k"),
 		bitrate_audio: String::from("192k"),
 	})?;
 
-	let mut muxer_mid = begin_stream(TEST_FILE, &Profile {
+	let mut muxer_mid = begin_stream(&mux_settings, &Profile {
 		level_name: "cdn00_mid",
 		bitrate_video: String::from("2250k"),
 		bitrate_audio: String::from("128k"),
 	})?;
 
-	let mut muxer_low = begin_stream(TEST_FILE, &Profile {
+	let mut muxer_low = begin_stream(&mux_settings, &Profile {
 		level_name: "cdn00_low",
 		bitrate_video: String::from("960k"),
 		bitrate_audio: String::from("96k"),
@@ -121,18 +236,13 @@ fn main() -> Result<(), failure::Error> {
 
 	info!("waiting on streams ...");
 	write_master_playlist()?;
-	muxer_src.wait();
-	muxer_mid.wait();
-	muxer_low.wait();
+	
+	muxer_src.wait()?;
+	muxer_mid.wait()?;
+	muxer_low.wait()?;
 
 	info!("all done :-)");
 	Ok(())
-}
-
-struct Profile {
-	level_name: &'static str,
-	bitrate_video: String,
-	bitrate_audio: String,
 }
 
 fn write_master_playlist() -> Result<(), failure::Error> {
@@ -159,30 +269,50 @@ fn write_master_playlist() -> Result<(), failure::Error> {
 	Ok(())
 }
 
-fn begin_stream(src_path: &str, prof: &Profile) -> Result<Child, failure::Error> {
+fn begin_stream(src: &MuxSettings, prof: &Profile) -> Result<Child, failure::Error> {
 	let seg_path = format!("{}/{}/index.m3u8", HLS_ROOT, prof.level_name);
 	let seg_name = format!("{}/{}/%03d.ts", HLS_ROOT, prof.level_name);
 
-	let ffmpeg_result = Command::new("ffmpeg")
+	let mut ffmpeg_cmd = Command::new("ffmpeg");
+
+	// setup basic video streaming properties
+	ffmpeg_cmd
 		.arg("-y")
 		.arg("-re")
-		.arg("-i").arg(src_path)
+		.arg("-i").arg(&src.av_path)
 		.arg("-b:v").arg(&prof.bitrate_video)
 		.arg("-c:v").arg("libx264")
 		.arg("-x264opts").arg("keyint=300:no-scenecut")
+		.arg("-pix_fmt").arg("yuv420p")
 		.arg("-profile:v").arg("main")
 		.arg("-r").arg("30")
 		.arg("-b:a").arg(&prof.bitrate_audio)
 		.arg("-c:a").arg("libfdk_aac")
-		.arg("-map").arg("0:v")
-		.arg("-map").arg("0:a")
+		.arg("-map").arg(&format!("v:{}", src.idx_v))
+		.arg("-map").arg(&format!("a:{}", src.idx_a));
+		
+
+	// TODO: PGM subtitles?
+	// add in subtitles
+	if let (&Some(ref st_path), &Some(ref st_idx)) = (&src.st_path, &src.ids_st) {
+		ffmpeg_cmd
+			.arg("-vf").arg(&format!("subtitles={}:si={}", st_path, st_idx));
+	}
+
+
+	// set up HLS output options
+	ffmpeg_cmd
 		.arg("-hls_list_size").arg("10")
 		.arg("-hls_time").arg("10")
 		.arg("-hls_flags").arg("delete_segments")
 		.arg("-hls_segment_filename").arg(seg_name)
-		.arg(&seg_path)
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
+		.arg(&seg_path);
+
+	info!("about to run: {:?}", ffmpeg_cmd);
+
+	let ffmpeg_result = ffmpeg_cmd
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
 		.spawn()?;
 
 	Ok(ffmpeg_result)
